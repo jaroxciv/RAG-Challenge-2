@@ -11,7 +11,7 @@ from typing import Iterable, List, Dict, Any
 from docling.backend.docling_parse_v2_backend import DoclingParseV2DocumentBackend
 # from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
 from docling.datamodel.base_models import ConversionStatus
-from docling.datamodel.document import ConversionResult, Table # Table might not be needed
+from docling.datamodel.document import ConversionResult #, Table # Table might not be needed
 
 _log = logging.getLogger(__name__)
 
