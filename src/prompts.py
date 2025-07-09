@@ -6,66 +6,69 @@ import re
 
 def build_system_prompt(instruction: str="", example: str="", pydantic_schema: str="") -> str:
     delimiter = "\n\n---\n\n"
-    schema = f"Your answer should be in JSON and strictly follow this schema, filling in the fields in the order they are given:\n```\n{pydantic_schema}\n```"
+    schema_instruction = f"Your answer should be in JSON and strictly follow this schema, filling in the fields in the order they are given:\n```\n{pydantic_schema}\n```"
     if example:
         example = delimiter + example.strip()
-    if schema:
-        schema = delimiter + schema.strip()
+    # Ensure schema instruction is present only if pydantic_schema is provided
+    if pydantic_schema:
+        schema_section = delimiter + schema_instruction.strip()
+    else:
+        schema_section = ""
     
-    system_prompt = instruction.strip() + schema + example
+    system_prompt = instruction.strip() + schema_section + example
     return system_prompt
 
 class RephrasedQuestionsPrompt:
     instruction = """
 You are a question rephrasing system.
-Your task is to break down a comparative question into individual questions for each company mentioned.
-Each output question must be self-contained, maintain the same intent and metric as the original question, be specific to the respective company, and use consistent phrasing.
+Your task is to break down a comparative question about podcasts into individual questions for each podcast episode or series mentioned.
+Each output question must be self-contained, maintain the same intent as the original question, be specific to the respective podcast identifier, and use consistent phrasing.
 """
 
     class RephrasedQuestion(BaseModel):
-        """Individual question for a company"""
-        company_name: str = Field(description="Company name, exactly as provided in quotes in the original question")
-        question: str = Field(description="Rephrased question specific to this company")
+        """Individual question for a podcast episode or series"""
+        podcast_identifier: str = Field(description="Podcast identifier (e.g., 'Episode 101', 'The Startup Chat' series), exactly as provided or inferred from the original question.")
+        question: str = Field(description="Rephrased question specific to this podcast identifier.")
 
     class RephrasedQuestions(BaseModel):
         """List of rephrased questions"""
-        questions: List['RephrasedQuestionsPrompt.RephrasedQuestion'] = Field(description="List of rephrased questions for each company")
+        questions: List['RephrasedQuestionsPrompt.RephrasedQuestion'] = Field(description="List of rephrased questions for each podcast identifier.")
 
     pydantic_schema = '''
 class RephrasedQuestion(BaseModel):
-    """Individual question for a company"""
-    company_name: str = Field(description="Company name, exactly as provided in quotes in the original question")
-    question: str = Field(description="Rephrased question specific to this company")
+    """Individual question for a podcast episode or series"""
+    podcast_identifier: str = Field(description="Podcast identifier (e.g., 'Episode 101', 'The Startup Chat' series), exactly as provided or inferred from the original question.")
+    question: str = Field(description="Rephrased question specific to this podcast identifier.")
 
 class RephrasedQuestions(BaseModel):
     """List of rephrased questions"""
-    questions: List['RephrasedQuestionsPrompt.RephrasedQuestion'] = Field(description="List of rephrased questions for each company")
+    questions: List['RephrasedQuestionsPrompt.RephrasedQuestion'] = Field(description="List of rephrased questions for each podcast identifier.")
 '''
 
     example = r"""
 Example:
 Input:
-Original comparative question: 'Which company had higher revenue in 2022, "Apple" or "Microsoft"?'
-Companies mentioned: "Apple", "Microsoft"
+Original comparative question: 'Which podcast, "Tech Talks Daily: Episode 345" or "AI Today: Episode 88", spent more time discussing ethical AI?'
+Podcast identifiers mentioned: "Tech Talks Daily: Episode 345", "AI Today: Episode 88"
 
 Output:
 {
     "questions": [
         {
-            "company_name": "Apple",
-            "question": "What was Apple's revenue in 2022?"
+            "podcast_identifier": "Tech Talks Daily: Episode 345",
+            "question": "How much time did \"Tech Talks Daily: Episode 345\" spend discussing ethical AI?"
         },
         {
-            "company_name": "Microsoft", 
-            "question": "What was Microsoft's revenue in 2022?"
+            "podcast_identifier": "AI Today: Episode 88",
+            "question": "How much time did \"AI Today: Episode 88\" spend discussing ethical AI?"
         }
     ]
 }
 """
 
-    user_prompt = "Original comparative question: '{question}'\n\nCompanies mentioned: {companies}"
+    user_prompt = "Original comparative question: '{question}'\n\nPodcast identifiers mentioned: {companies}" # {companies} will be replaced by podcast_identifiers
 
-    system_prompt = build_system_prompt(instruction, example)
+    system_prompt = build_system_prompt(instruction, example) # Schema is implicitly part of the example's output format
 
     system_prompt_with_schema = build_system_prompt(instruction, example, pydantic_schema)
 
@@ -73,15 +76,16 @@ Output:
 class AnswerWithRAGContextSharedPrompt:
     instruction = """
 You are a RAG (Retrieval-Augmented Generation) answering system.
-Your task is to answer the given question based only on information from the company's annual report, which is uploaded in the format of relevant pages extracted using RAG.
+Your task is to answer the given question based only on information from the podcast transcript(s), which is uploaded in the format of relevant segments extracted using RAG.
 
 Before giving a final answer, carefully think out loud and step by step. Pay special attention to the wording of the question.
 - Keep in mind that the content containing the answer may be worded differently than the question.
-- The question was autogenerated from a template, so it may be meaningless or not applicable to the given company.
+- The question might be general or specific to a particular episode or speaker.
+- If the question is about a specific episode and context from other episodes is provided, focus only on the relevant episode's context unless the question implies a broader search.
 """
 
     user_prompt = """
-Here is the context:
+Here is the context (relevant transcript segments):
 \"\"\"
 {context}
 \"\"\"
@@ -92,29 +96,21 @@ Here is the question:
 "{question}"
 """
 
-class AnswerWithRAGContextNamePrompt:
+class AnswerWithRAGContextNamePrompt: # For questions expecting a name, title, or specific text
     instruction = AnswerWithRAGContextSharedPrompt.instruction
     user_prompt = AnswerWithRAGContextSharedPrompt.user_prompt
 
     class AnswerSchema(BaseModel):
-        step_by_step_analysis: str = Field(description="Detailed step-by-step analysis of the answer with at least 5 steps and at least 150 words. Pay special attention to the wording of the question to avoid being tricked. Sometimes it seems that there is an answer in the context, but this is might be not the requested value, but only a similar one.")
-
-        reasoning_summary: str = Field(description="Concise summary of the step-by-step reasoning process. Around 50 words.")
-
-        relevant_pages: List[int] = Field(description="""
-List of page numbers containing information directly used to answer the question. Include only:
-- Pages with direct answers or explicit statements
-- Pages with key information that strongly supports the answer
-Do not include pages with only tangentially related information or weak connections to the answer.
-At least one page should be included in the list.
-""")
-
+        step_by_step_analysis: str = Field(description="Detailed step-by-step analysis of the answer with at least 3-5 steps and around 100-150 words. Analyze the question's intent and how the provided context helps answer it. Identify key phrases or information in the context.")
+        reasoning_summary: str = Field(description="Concise summary of the step-by-step reasoning process. Around 30-50 words.")
+        relevant_pages: List[int] = Field(description="List of page numbers from the transcript containing information directly used to answer the question. Include only pages with direct answers or key supporting information. At least one page should be included if an answer is found.")
         final_answer: Union[str, Literal["N/A"]] = Field(description="""
-If it is a company name, should be extracted exactly as it appears in question.
-If it is a person name, it should be their full name.
-If it is a product name, it should be extracted exactly as it appears in the context.
-Without any extra information, words or comments.
-- Return 'N/A' if information is not available in the context
+The answer should be a specific name, title, or a short textual quote extracted directly from the context.
+- If a speaker's name is requested: "John Doe".
+- If an episode title is requested (and available): "The Future of AI".
+- If a specific quote or term is asked for: "innovation is key".
+- If the question asks "What is Episode X about?", provide a concise summary if possible, or key topics.
+- Return 'N/A' if the information is not available in the provided context.
 """)
 
     pydantic_schema = re.sub(r"^ {4}", "", inspect.getsource(AnswerSchema), flags=re.MULTILINE)
@@ -122,81 +118,42 @@ Without any extra information, words or comments.
     example = r"""
 Example:
 Question: 
-"Who was the CEO of 'Southwest Airlines Co.'?" 
+"Who is the main speaker in 'Episode 90' discussing interview techniques?"
+
+Context:
+Page 1: "[00:00:00.02] Marcell: If you could interview anyone, who would it be and why?"
+Page 1: "[00:00:05.10] Marcell: Today we're diving deep into how to conduct great interviews."
+Page 2: "[00:01:30.45] GuestSpeaker: My top tip is always prepare..."
 
 Answer: 
 ```
 {
-  "step_by_step_analysis": "1. The question asks for the CEO of 'Southwest Airlines Co.'. The CEO is typically the highest-ranking executive responsible for the overall management of the company, sometimes referred to as the President or Managing Director.\n2. My source of information is a document that appears to be 'Southwest Airlines Co.''s annual report. This document will be used to identify the individual holding the CEO position.\n3. Within the provided document, there is a section that identifies Robert E. Jordan as the President & Chief Executive Officer of 'Southwest Airlines Co.'. The document confirms his role since February 2022.\n4. Therefore, based on the information found in the document, the CEO of 'Southwest Airlines Co.' is Robert E. Jordan.",
-  "reasoning_summary": "'Southwest Airlines Co.''s annual report explicitly names Robert E. Jordan as President & Chief Executive Officer since February 2021. This directly answers the question.",
-  "relevant_pages": [58],
-  "final_answer": "Robert E. Jordan"
+  "step_by_step_analysis": "1. The question asks for the main speaker in 'Episode 90' discussing interview techniques.\n2. The provided context is from a podcast transcript, likely Episode 90.\n3. On Page 1, a speaker named 'Marcell' introduces the topic of conducting great interviews.\n4. While a 'GuestSpeaker' is mentioned on Page 2, Marcell initiated the discussion on interview techniques.\n5. Based on the initial context, Marcell is identified as a key speaker on this topic.",
+  "reasoning_summary": "The transcript segments show Marcell introducing the topic of interviews in Episode 90. He appears to be a main speaker on this subject based on the provided context.",
+  "relevant_pages": [1],
+  "final_answer": "Marcell"
 }
 ```
 """ 
 
     system_prompt = build_system_prompt(instruction, example)
-
     system_prompt_with_schema = build_system_prompt(instruction, example, pydantic_schema)
 
 
-
-class AnswerWithRAGContextNumberPrompt:
+class AnswerWithRAGContextNumberPrompt: # For questions expecting a numerical answer
     instruction = AnswerWithRAGContextSharedPrompt.instruction
     user_prompt = AnswerWithRAGContextSharedPrompt.user_prompt
 
     class AnswerSchema(BaseModel):
-        step_by_step_analysis: str = Field(description="""
-Detailed step-by-step analysis of the answer with at least 5 steps and at least 150 words.
-**Strict Metric Matching Required:**    
-
-1. Determine the precise concept the question's metric represents. What is it actually measuring?
-2. Examine potential metrics in the context. Don't just compare names; consider what the context metric measures.
-3. Accept ONLY if: The context metric's meaning *exactly* matches the target metric. Synonyms are acceptable; conceptual differences are NOT.
-4. Reject (and use 'N/A') if:
-    - The context metric covers more or less than the question's metric.
-    - The context metric is a related concept but not the *exact* equivalent (e.g., a proxy or a broader category).
-    - Answering requires calculation, derivation, or inference.
-    - Aggregation Mismatch: The question needs a single value but the context offers only an aggregated total
-5. No Guesswork: If any doubt exists about the metric's equivalence, default to `N/A`."
-""")
-
-        reasoning_summary: str = Field(description="Concise summary of the step-by-step reasoning process. Around 50 words.")
-
-        relevant_pages: List[int] = Field(description="""
-List of page numbers containing information directly used to answer the question. Include only:
-- Pages with direct answers or explicit statements
-- Pages with key information that strongly supports the answer
-Do not include pages with only tangentially related information or weak connections to the answer.
-At least one page should be included in the list.
-""")
-
-        final_answer: Union[float, int, Literal['N/A']] = Field(description="""
-An exact metric number is expected as the answer.
-- Example for percentages:
-    Value from context: 58,3%
-    Final answer: 58.3
-
-Pay special attention to any mentions in the context about whether metrics are reported in units, thousands, or millions to adjust number in final answer with no changes, three zeroes or six zeroes accordingly.
-Pay attention if value wrapped in parentheses, it means that value is negative.
-
-- Example for negative values:
-    Value from context: (2,124,837) CHF
-    Final answer: -2124837
-
-- Example for numbers in thousands:
-    Value from context: 4970,5 (in thousands $)
-    Final answer: 4970500
-
-- Return 'N/A' if metric provided is in a different currency than mentioned in the question
-    Example of value from context: 780000 USD, but question mentions EUR
-    Final answer: 'N/A'
-
-- Return 'N/A' if metric is not directly stated in context EVEN IF it could be calculated from other metrics in the context
-    Example: Requested metric: Dividend per Share; Only available metrics from context: Total Dividends Paid ($5,000,000), and Number of Outstanding Shares (1,000,000); Calculated DPS = Total Dividends / Outstanding Shares.
-    Final answer: 'N/A'
-
-- Return 'N/A' if information is not available in the context
+        step_by_step_analysis: str = Field(description="Detailed step-by-step analysis. Identify what numerical value is being asked for (e.g., episode number, count of mentions, specific statistic if mentioned). Scan context for numbers related to the query. Ensure the number directly answers the question.")
+        reasoning_summary: str = Field(description="Concise summary of reasoning.")
+        relevant_pages: List[int] = Field(description="List of page numbers containing the numerical answer or strong support for it.")
+        final_answer: Union[int, float, Literal['N/A']] = Field(description="""
+The exact numerical answer.
+- If an episode number is asked: 102.
+- If a count is asked (e.g. "how many statistics"): 3.
+- Avoid ranges unless specifically asked.
+- Return 'N/A' if the specific number is not found or cannot be directly extracted.
 """)
 
     pydantic_schema = re.sub(r"^ {4}", "", inspect.getsource(AnswerSchema), flags=re.MULTILINE)
@@ -204,115 +161,74 @@ Pay attention if value wrapped in parentheses, it means that value is negative.
     example = r"""
 Example 1:
 Question:
-"What was the total assets of 'Waste Connections Inc.' in the fiscal year 2022?"
+"What is the episode number where John discusses customer dissatisfaction statistics?"
+
+Context:
+Page 1: "Episode 102. [00:00:00.02] John: I once tried to get an organisation to change..."
+Page 1: "[00:00:23.00] John: ...85% of people believe that organizations now have lost that human touch..."
 
 Answer:
 ```
 {
-  "step_by_step_analysis": "1. **Metric Definition:** The question asks for 'total assets' for 'Waste Connections Inc.' in fiscal year 2022.  'Total assets' represents the sum of all resources owned or controlled by the company, expected to provide future economic benefits.\n2. **Context Examination:** The context includes 'Consolidated Balance Sheets' (page 78), a standard financial statement that reports a company's assets, liabilities, and equity.\n3. **Metric Matching:** On page 78, under 'December 31, 2022', a line item labeled 'Total assets' exists.  This directly matches the concept requested in the question.\n4. **Value Extraction and Adjustment:** The value for 'Total assets' is '$18,500,342'. The context indicates this is in thousands of dollars.  Therefore, the full value is 18,500,342,000.\n5. **Confirmation**: No calculation beyond unit adjustment was needed. The reported metric directly matches the question.",
-  "reasoning_summary": "The 'Total assets' value for fiscal year 2022 was directly found on the 'Consolidated Balance Sheets' (page 78). The reported value was in thousands, requiring multiplication by 1000 for the final answer.",
-  "relevant_pages": [78],
-  "final_answer": 18500342000
-}
-```
-
-
-Example 2:
-Question:
-"For Ritter Pharmaceuticals, Inc., what was the value of Research and development equipment, at cost at the end of the period listed in annual report?"
-
-Answer:
-```
-{
-  "step_by_step_analysis": "1. The question asks for 'Research and development equipment, at cost' for Ritter Pharmaceuticals, Inc. This indicates a specific value from the balance sheet, representing the *original purchase price* of equipment specifically used for R&D, *without* any accumulated depreciation.\n2. The context (page 35) shows 'Property and equipment, net' at $12,500.  This is a *net* value (after depreciation), and it's a *broader* category, encompassing all property and equipment, not just R&D equipment.\n3. The context (page 37) also mentions 'Accumulated Depreciation' of $110,000 for 'Machinery and Equipment'. This represents the total *depreciation*, not the original cost, and, importantly, it doesn't specify that this equipment is *exclusively* for R&D.\n4. Neither of these metrics *exactly* matches the requested metric. 'Property and equipment, net' is too broad and represents the depreciated value. 'Accumulated Depreciation' only shows depreciation, not cost, and lacks R&D specificity.\n5. Since the context doesn't provide the *original cost* of *only* R&D equipment, and we cannot make assumptions, perform calculations, or combine information, the answer is 'N/A'.",
-  "reasoning_summary": "The context lacks a specific line item for 'Research and development equipment, at cost.' 'Property and equipment, net' is depreciated and too broad, while 'Accumulated Depreciation' only represents depreciation, not original cost, and is not R&D-specific. Strict matching requires 'N/A'.",
-  "relevant_pages": [ 35, 37 ],
-  "final_answer": "N/A"
+  "step_by_step_analysis": "1. The question asks for an episode number related to John discussing customer dissatisfaction statistics.\n2. The context for Page 1 starts with 'Episode 102' and features John speaking.\n3. John then mentions statistics like '85% of people believe...'.\n4. This directly links Episode 102 to John discussing these statistics.\n5. The episode number is 102.",
+  "reasoning_summary": "The context explicitly states 'Episode 102' at the beginning of a segment where John discusses customer dissatisfaction statistics.",
+  "relevant_pages": [1],
+  "final_answer": 102
 }
 ```
 """
-
     system_prompt = build_system_prompt(instruction, example)
-
     system_prompt_with_schema = build_system_prompt(instruction, example, pydantic_schema)
 
 
-
-class AnswerWithRAGContextBooleanPrompt:
+class AnswerWithRAGContextBooleanPrompt: # For Yes/No questions
     instruction = AnswerWithRAGContextSharedPrompt.instruction
     user_prompt = AnswerWithRAGContextSharedPrompt.user_prompt
 
     class AnswerSchema(BaseModel):
-        step_by_step_analysis: str = Field(description="Detailed step-by-step analysis of the answer with at least 5 steps and at least 150 words. Pay special attention to the wording of the question to avoid being tricked. Sometimes it seems that there is an answer in the context, but this is might be not the requested value, but only a similar one.")
-
-        reasoning_summary: str = Field(description="Concise summary of the step-by-step reasoning process. Around 50 words.")
-
-        relevant_pages: List[int] = Field(description="""
-List of page numbers containing information directly used to answer the question. Include only:
-- Pages with direct answers or explicit statements
-- Pages with key information that strongly supports the answer
-Do not include pages with only tangentially related information or weak connections to the answer.
-At least one page should be included in the list.
-""")
-        
-        final_answer: Union[bool] = Field(description="""
-A boolean value (True or False) extracted from the context that precisely answers the question.
-If question ask about did something happen, and in context there is information about it, return False.
-""")
+        step_by_step_analysis: str = Field(description="Detailed step-by-step analysis. Does the context confirm or deny the statement in the question? Look for explicit mentions or strong implications.")
+        reasoning_summary: str = Field(description="Concise summary of reasoning.")
+        relevant_pages: List[int] = Field(description="List of page numbers supporting the True/False answer.")
+        final_answer: Union[bool, Literal['N/A']] = Field(description="A boolean value (True or False). Return 'N/A' if the context is insufficient to determine a True/False answer.")
 
     pydantic_schema = re.sub(r"^ {4}", "", inspect.getsource(AnswerSchema), flags=re.MULTILINE)
 
     example = r"""
+Example:
 Question:
-"Did W. P. Carey Inc. announce any changes to its dividend policy in the annual report?"
+"Does 'Episode 102' mention the concept of 'empowerment'?"
+
+Context:
+Page 1: "[00:01:15.00] John: You have to have that culture of empowerment and freedom to try things..."
 
 Answer:
 ```
 {
-  "step_by_step_analysis": "1. The question asks whether W. P. Carey Inc. announced changes to its dividend policy.\n2. The phrase 'changes to its dividend policy' requires careful interpretation. It means any adjustment to the framework, rules, or stated intentions that dictate how the company determines and distributes dividends.\n3. The context (page 12, 18) states that the company increased its annualized dividend to $4.27 per share in the fourth quarter of 2023, compared to $4.22 per share in the same period of 2022. Page 45 mentions further details about dividend.\n4. Consistent, incremental increases throughout the year, with explicit mentions of maintaining a 'steady and growing' dividend, indicates no changes to *policy*, though the *amount* increased as planned within the existing policy.",
-  "reasoning_summary": "The context highlights consistent, small increases to the dividend throughout the year, consistent with a stated policy of providing a 'steady and growing' dividend. While the dividend *amount* changed, the *policy* governing those increases remained consistent. The question asks about *policy* changes, not amount changes.",
-  "relevant_pages": [12, 18, 45],
-  "final_answer": False
+  "step_by_step_analysis": "1. The question asks if 'Episode 102' mentions 'empowerment'.\n2. The provided context is from a podcast transcript, presumably Episode 102.\n3. On Page 1, John is quoted saying 'You have to have that culture of empowerment...'.\n4. This directly confirms the mention of 'empowerment'.\n5. Therefore, the answer is True.",
+  "reasoning_summary": "The transcript segment from Page 1 explicitly shows John using the word 'empowerment'.",
+  "relevant_pages": [1],
+  "final_answer": True
 }
 ```
 """
-
     system_prompt = build_system_prompt(instruction, example)
-
     system_prompt_with_schema = build_system_prompt(instruction, example, pydantic_schema)
 
 
-
-class AnswerWithRAGContextNamesPrompt:
+class AnswerWithRAGContextNamesPrompt: # For questions expecting a list of names/items
     instruction = AnswerWithRAGContextSharedPrompt.instruction
     user_prompt = AnswerWithRAGContextSharedPrompt.user_prompt
 
     class AnswerSchema(BaseModel):
-        step_by_step_analysis: str = Field(description="Detailed step-by-step analysis of the answer with at least 5 steps and at least 150 words. Pay special attention to the wording of the question to avoid being tricked. Sometimes it seems that there is an answer in the context, but this is might be not the requested entity, but only a similar one.")
-
-        reasoning_summary: str = Field(description="Concise summary of the step-by-step reasoning process. Around 50 words.")
-
-        relevant_pages: List[int] = Field(description="""
-List of page numbers containing information directly used to answer the question. Include only:
-- Pages with direct answers or explicit statements
-- Pages with key information that strongly supports the answer
-Do not include pages with only tangentially related information or weak connections to the answer.
-At least one page should be included in the list.
-""")
-
+        step_by_step_analysis: str = Field(description="Detailed step-by-step analysis. Identify what list of items is requested (e.g., speakers, topics, episode titles). Extract these items from the context. Ensure they are distinct and relevant.")
+        reasoning_summary: str = Field(description="Concise summary of reasoning.")
+        relevant_pages: List[int] = Field(description="List of page numbers where the names/items are found.")
         final_answer: Union[List[str], Literal["N/A"]] = Field(description="""
-Each entry should be extracted exactly as it appears in the context.
-
-If the question asks about positions (e.g., changes in positions), return ONLY position titles, WITHOUT names or any additional information. Appointments on new leadership positions also should be counted as changes in positions. If several changes related to position with same title are mentioned, return title of such position only once. Position title always should be in singular form.
-Example of answer ['Chief Technology Officer', 'Board Member', 'Chief Executive Officer']
-
-If the question asks about names, return ONLY the full names exactly as they are in the context.
-Example of answer ['Carly Kennedy', 'Brian Appelgate Jr.']
-
-If the question asks about new launched products, return ONLY the product names exactly as they are in the context. Candidates for new products or products in testing phase not counted as new launched products.
-Example of answer ['EcoSmart 2000', 'GreenTech Pro']
-
-- Return 'N/A' if information is not available in the context
+A list of strings. Each string should be an item extracted from the context.
+- If speakers are asked for: ["John Doe", "Jane Smith"].
+- If topics are asked for: ["customer experience", "company culture", "metrics"].
+- If episode titles are asked for: ["Episode 90: Interview Masterclass", "Episode 102: The Human Touch"].
+- Return 'N/A' if no relevant items are found in the context.
 """)
 
     pydantic_schema = re.sub(r"^ {4}", "", inspect.getsource(AnswerSchema), flags=re.MULTILINE)
@@ -320,44 +236,45 @@ Example of answer ['EcoSmart 2000', 'GreenTech Pro']
     example = r"""
 Example:
 Question:
-"What are the names of all new executives that took on new leadership positions in company?"
+"What are the key statistics John mentions about customer dissatisfaction in 'Episode 102'?"
+
+Context:
+Page 1: "[00:00:23.00] John: ...85% of people believe that organizations now have lost that human touch, 83% believe that organizations take customers for granted. 81% believe that organizations are more interested in cutting costs than creating a great experience..."
 
 Answer:
 ```
 {
-    "step_by_step_analysis": "1. The question asks for the names of all new executives who took on new leadership positions in the company.\n2. Exhibit 10.9 and 10.10, as listed in the Exhibit Index on page 89, mentions new Executive Agreements with Carly Kennedy and Brian Appelgate.\n3. Exhibit 10.9, Employment Agreement with Carly Kennedy, states her start date as April 4, 2022, and her position as Executive Vice President and General Counsel.\n4. Exhibit 10.10, Offer Letter with Brian Appelgate shows that his new role within the company is Interim Chief Operations Officer, and he was accepting the offer on November 8, 2022.\n5. Based on the documents, Carly Kennedy and Brian Appelgate are named as the new executives.",
-    "reasoning_summary": "Exhibits 10.9 and 10.10 of the annual report, described as Employment Agreement and Offer Letter, explicitly name Carly Kennedy and Brian Appelgate taking on new leadership roles within the company in 2022.",
-    "relevant_pages": [
-        89
-    ],
+    "step_by_step_analysis": "1. The question asks for key statistics John mentions about customer dissatisfaction in 'Episode 102'.\n2. The context is from Page 1 of a transcript where John is speaking.\n3. John states: '85% of people believe that organizations now have lost that human touch'.\n4. John also states: '83% believe that organizations take customers for granted'.\n5. John further states: '81% believe that organizations are more interested in cutting costs than creating a great experience'.\n6. These are three distinct statistics related to customer dissatisfaction mentioned by John.",
+    "reasoning_summary": "The transcript on Page 1 shows John listing three specific percentages related to customer beliefs about organizations, which align with the concept of dissatisfaction.",
+    "relevant_pages": [1],
     "final_answer": [
-        "Carly Kennedy",
-        "Brian Appelgate"
+        "85% of people believe that organizations now have lost that human touch",
+        "83% believe that organizations take customers for granted",
+        "81% believe that organizations are more interested in cutting costs than creating a great experience"
     ]
 }
 ```
 """
-
     system_prompt = build_system_prompt(instruction, example)
-
     system_prompt_with_schema = build_system_prompt(instruction, example, pydantic_schema)
 
-class ComparativeAnswerPrompt:
+
+class ComparativeAnswerPrompt: # For comparing multiple podcast episodes/series
     instruction = """
 You are a question answering system.
-Your task is to analyze individual company answers and provide a comparative response that answers the original question.
+Your task is to analyze individual answers related to different podcast episodes or series and provide a comparative response that answers the original question.
 Base your analysis only on the provided individual answers - do not make assumptions or include external knowledge.
 Before giving a final answer, carefully think out loud and step by step.
 
 Important rules for comparison:
-- When the question asks to choose one of the companies (e.g., when comparing metrics), return the company name exactly as it appears in the original question
-- If a company's metric is in a different currency than what is asked in the question, exclude that company from comparison
-- If all companies are excluded (due to currency mismatch or other reasons), return 'N/A' as the final answer
-- If all companies except one are excluded, return the name of the remaining company (even though there is no actual comparison possible)
+- When the question asks to choose one of the podcast identifiers (e.g., when comparing number of mentions, topics covered), return the podcast identifier (e.g., "Episode 101", "The Startup Chat") that best fits the comparison.
+- If data for a podcast identifier is 'N/A' or insufficient for comparison, exclude it.
+- If all podcast identifiers are excluded, or if a comparison cannot be made from the provided answers, return 'N/A' as the final answer.
+- If only one podcast identifier remains after exclusions, return that identifier if the question implies a selection (e.g. "which had more...").
 """
 
     user_prompt = """
-Here are the individual company answers:
+Here are the individual podcast episode/series answers:
 \"\"\"
 {context}
 \"\"\"
@@ -369,15 +286,12 @@ Here is the original comparative question:
 """
 
     class AnswerSchema(BaseModel):
-        step_by_step_analysis: str = Field(description="Detailed step-by-step analysis of the answer with at least 5 steps and at least 150 words.")
-
-        reasoning_summary: str = Field(description="Concise summary of the step-by-step reasoning process. Around 50 words.")
-
-        relevant_pages: List[int] = Field(description="Just leave empty")
-
+        step_by_step_analysis: str = Field(description="Detailed step-by-step analysis of the comparison. At least 3-5 steps. Explain how you are comparing the individual answers based on the question's criteria.")
+        reasoning_summary: str = Field(description="Concise summary of the comparative reasoning process.")
+        relevant_pages: List[int] = Field(description="Leave empty, as this is a comparison of prior answers.")
         final_answer: Union[str, Literal["N/A"]] = Field(description="""
-Company name should be extracted exactly as it appears in question.
-Answer should be either a single company name or 'N/A' if no company is applicable.
+The podcast identifier (e.g., "Episode 101", "The Daily Show") that is the result of the comparison, or 'N/A'.
+The identifier should be extracted exactly as it appears in the input or individual answers.
 """)
 
     pydantic_schema = re.sub(r"^ {4}", "", inspect.getsource(AnswerSchema), flags=re.MULTILINE)
@@ -385,25 +299,29 @@ Answer should be either a single company name or 'N/A' if no company is applicab
     example = r"""
 Example:
 Question:
-"Which of the companies had the lowest total assets in USD at the end of the period listed in the annual report: "CrossFirst Bank", "Sleep Country Canada Holdings Inc.", "Holley Inc.", "PowerFleet, Inc.", "Petra Diamonds"? If data for the company is not available, exclude it from the comparison."
+"Which podcast episode, 'Episode 90' or 'Episode 102', has more mentions of the term 'culture'?"
+
+Individual Answers Context:
+{
+    "Episode 90": {"final_answer": 2, "relevant_pages": [3, 5]},
+    "Episode 102": {"final_answer": 5, "relevant_pages": [1, 4]}
+}
 
 Answer:
 ```
 {
-  "step_by_step_analysis": "1. The question asks for the company with the lowest total assets in USD.\n2. Gather the total assets in USD for each company from the individual answers: CrossFirst Bank: $6,601,086,000; Holley Inc.: $1,249,642,000; PowerFleet, Inc.: $217,435,000; Petra Diamonds: $1,078,600,000.\n3. Sleep Country Canada Holdings Inc. is excluded because its assets are not reported in USD.\n4. Compare the total assets: PowerFleet, Inc. ($217,435,000) < Petra Diamonds ($1,078,600,000) < Holley Inc. ($1,249,642,000)  < CrossFirst Bank ($6,601,086,000).\n5. Therefore, PowerFleet, Inc. has the lowest total assets in USD.",
-  "reasoning_summary": "The individual answers provided the total assets in USD for each company except Sleep Country Canada Holdings Inc. (excluded due to currency mismatch). Direct comparison shows PowerFleet, Inc. has the lowest total assets.",
+  "step_by_step_analysis": "1. The question asks to compare 'Episode 90' and 'Episode 102' based on the number of mentions of 'culture'.\n2. From the individual answers, 'Episode 90' had 2 mentions of 'culture'.\n3. 'Episode 102' had 5 mentions of 'culture'.\n4. Comparing the counts: 5 (Episode 102) > 2 (Episode 90).\n5. Therefore, 'Episode 102' had more mentions of 'culture'.",
+  "reasoning_summary": "'Episode 102' mentioned 'culture' 5 times, while 'Episode 90' mentioned it 2 times. Thus, 'Episode 102' had more mentions.",
   "relevant_pages": [],
-  "final_answer": "PowerFleet, Inc."
+  "final_answer": "Episode 102"
 }
 ```
 """
-
     system_prompt = build_system_prompt(instruction, example)
-    
     system_prompt_with_schema = build_system_prompt(instruction, example, pydantic_schema)
 
 
-class AnswerSchemaFixPrompt:
+class AnswerSchemaFixPrompt: # This prompt seems generally applicable, no major changes needed.
     system_prompt = """
 You are a JSON formatter.
 Your task is to format raw LLM response into a valid JSON object.
@@ -426,9 +344,7 @@ Here is the LLM response that not following the schema and needs to be properly 
 """
 
 
-
-
-class RerankingPrompt:
+class RerankingPrompt: # General relevance ranking, likely no changes needed for podcast context.
     system_prompt_rerank_single_block = """
 You are a RAG (Retrieval-Augmented Generation) retrievals ranker.
 

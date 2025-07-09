@@ -1,0 +1,26 @@
+[
+    {
+        "text": "Are there any podcasts that talk about building a company?",
+        "kind": "boolean"
+    },
+    {
+        "text": "Which episodes feature John talking about customer experience?",
+        "kind": "names"
+    },
+    {
+        "text": "In Episode 102, what are the main statistics John mentions about customer dissatisfaction?",
+        "kind": "names"
+    },
+    {
+        "text": "What is Episode 90 about?",
+        "kind": "text"
+    },
+    {
+        "text": "Suggest some podcast episodes that discuss leadership.",
+        "kind": "names"
+    },
+    {
+        "text": "Which episode mentions 'human lives wasted' in the context of call centers?",
+        "kind": "name"
+    }
+]

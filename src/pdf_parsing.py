@@ -3,28 +3,36 @@ import time
 import logging
 import re
 import json
-from tabulate import tabulate
+# from tabulate import tabulate # No longer needed for podcast parsing
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Dict, Any
 
 # from docling.backend.docling_parse_backend import DoclingParseDocumentBackend
 from docling.backend.docling_parse_v2_backend import DoclingParseV2DocumentBackend
 # from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
 from docling.datamodel.base_models import ConversionStatus
-from docling.datamodel.document import ConversionResult
+from docling.datamodel.document import ConversionResult, Table # Table might not be needed
 
 _log = logging.getLogger(__name__)
 
-def _process_chunk(pdf_paths, pdf_backend, output_dir, num_threads, metadata_lookup, debug_data_path):
+# Regex to capture podcast transcript lines
+# Assumes timestamps like [00:00:00.00] or [00:00:00]
+# Speaker names can contain spaces. Text can be anything.
+PODCAST_LINE_RE = re.compile(r"^\s*\[(\d{2}:\d{2}:\d{2}(?:\.\d{2,3})?)\]\s*([^:]+):\s*(.*)")
+EPISODE_TITLE_RE = re.compile(r"Episode\s+(\d+)", re.IGNORECASE)
+YOUTUBE_URL_RE = re.compile(r"(https?://youtu\.be/[^\s]+)")
+
+
+def _process_chunk(pdf_paths, pdf_backend, output_dir, num_threads, debug_data_path): # Removed metadata_lookup
     """Helper function to process a chunk of PDFs in a separate process."""
     # Create a new parser instance for this process
     parser = PDFParser(
         pdf_backend=pdf_backend,
         output_dir=output_dir,
         num_threads=num_threads,
-        csv_metadata_path=None  # Metadata lookup is passed directly
+        # csv_metadata_path=None # Removed
     )
-    parser.metadata_lookup = metadata_lookup
+    # parser.metadata_lookup = metadata_lookup # Removed
     parser.debug_data_path = debug_data_path
     parser.parse_and_export(pdf_paths)
     return f"Processed {len(pdf_paths)} PDFs."
@@ -35,51 +43,52 @@ class PDFParser:
         pdf_backend=DoclingParseV2DocumentBackend,
         output_dir: Path = Path("./parsed_pdfs"),
         num_threads: int = None,
-        csv_metadata_path: Path = None,
+        # csv_metadata_path: Path = None, # Removed
     ):
         self.pdf_backend = pdf_backend
         self.output_dir = output_dir
         self.doc_converter = self._create_document_converter()
         self.num_threads = num_threads
-        self.metadata_lookup = {}
+        # self.metadata_lookup = {} # Removed
         self.debug_data_path = None
 
-        if csv_metadata_path is not None:
-            self.metadata_lookup = self._parse_csv_metadata(csv_metadata_path)
+        # if csv_metadata_path is not None: # Removed
+        #     self.metadata_lookup = self._parse_csv_metadata(csv_metadata_path) # Removed
             
         if self.num_threads is not None:
             os.environ["OMP_NUM_THREADS"] = str(self.num_threads)
 
-    @staticmethod
-    def _parse_csv_metadata(csv_path: Path) -> dict:
-        """Parse CSV file and create a lookup dictionary with sha1 as key."""
-        import csv
-        metadata_lookup = {}
+    # @staticmethod # Removed
+    # def _parse_csv_metadata(csv_path: Path) -> dict: # Removed
+    #     """Parse CSV file and create a lookup dictionary with sha1 as key.""" # Removed
+    #     import csv # Removed
+    #     metadata_lookup = {} # Removed
         
-        with open(csv_path, 'r', encoding='utf-8') as csvfile:
-            reader = csv.DictReader(csvfile)
-            for row in reader:
-                # Handle both old and new CSV formats for company name
-                company_name = row.get('company_name', row.get('name', '')).strip('"')
-                metadata_lookup[row['sha1']] = {
-                    'company_name': company_name
-                }
-        return metadata_lookup
+    #     with open(csv_path, 'r', encoding='utf-8') as csvfile: # Removed
+    #         reader = csv.DictReader(csvfile) # Removed
+    #         for row in reader: # Removed
+    #             # Handle both old and new CSV formats for company name # Removed
+    #             company_name = row.get('company_name', row.get('name', '')).strip('"') # Removed
+    #             metadata_lookup[row['sha1']] = { # Removed
+    #                 'company_name': company_name # Removed
+    #             } # Removed
+    #     return metadata_lookup # Removed
 
     def _create_document_converter(self) -> "DocumentConverter": # type: ignore
         """Creates and returns a DocumentConverter with default pipeline options."""
         from docling.document_converter import DocumentConverter, FormatOption
-        from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode, EasyOcrOptions
+        from docling.datamodel.pipeline_options import PdfPipelineOptions, EasyOcrOptions # Removed TableFormerMode
         from docling.datamodel.base_models import InputFormat
         from docling.pipeline.standard_pdf_pipeline import StandardPdfPipeline
         
         pipeline_options = PdfPipelineOptions()
-        pipeline_options.do_ocr = True
+        pipeline_options.do_ocr = True # Keep OCR, it's useful for PDFs from images
         ocr_options = EasyOcrOptions(lang=['en'], force_full_page_ocr=False)
         pipeline_options.ocr_options = ocr_options
-        pipeline_options.do_table_structure = True
-        pipeline_options.table_structure_options.do_cell_matching = True
-        pipeline_options.table_structure_options.mode = TableFormerMode.ACCURATE
+        # pipeline_options.do_table_structure = True # Disable table processing
+        # pipeline_options.table_structure_options.do_cell_matching = True # Disable
+        # pipeline_options.table_structure_options.mode = TableFormerMode.ACCURATE # Disable
+        pipeline_options.do_table_structure = False # Explicitly disable
         
         format_options = {
             InputFormat.PDF: FormatOption(
@@ -104,17 +113,19 @@ class PDFParser:
         for conv_res in conv_results:
             if conv_res.status == ConversionStatus.SUCCESS:
                 success_count += 1
-                processor = JsonReportProcessor(metadata_lookup=self.metadata_lookup, debug_data_path=self.debug_data_path)
+                # Pass None for metadata_lookup as it's removed from JsonReportProcessor init
+                processor = JsonPodcastProcessor(debug_data_path=self.debug_data_path)
                 
-                # Normalize the document data to ensure sequential pages
+                # Normalize the document data to ensure sequential pages (still useful)
                 data = conv_res.document.export_to_dict()
-                normalized_data = self._normalize_page_sequence(data)
+                # normalized_data = self._normalize_page_sequence(data) # Normalization might not be critical if content flows well
                 
-                processed_report = processor.assemble_report(conv_res, normalized_data)
+                # The new processor will take raw 'data'
+                processed_podcast_json = processor.assemble_podcast_json(conv_res, data)
                 doc_filename = conv_res.input.file.stem
                 if self.output_dir is not None:
                     with (self.output_dir / f"{doc_filename}.json").open("w", encoding="utf-8") as fp:
-                        json.dump(processed_report, fp, indent=2, ensure_ascii=False)
+                        json.dump(processed_podcast_json, fp, indent=2, ensure_ascii=False)
             else:
                 failure_count += 1
                 _log.info(f"Document {conv_res.input.file} failed to convert.")
@@ -122,30 +133,31 @@ class PDFParser:
         _log.info(f"Processed {success_count + failure_count} docs, of which {failure_count} failed")
         return success_count, failure_count
 
+    # _normalize_page_sequence might still be useful if PDFs have blank pages or page order issues.
+    # For now, let's assume clean PDFs and potentially remove it later if not needed.
     def _normalize_page_sequence(self, data: dict) -> dict:
         """Ensure that page numbers in content are sequential by filling gaps with empty pages."""
-        if 'content' not in data:
+        if 'content' not in data or not data['content']: # check if content is empty
             return data
         
-        # Create a copy of the data to modify
         normalized_data = data.copy()
         
-        # Get existing page numbers and find max page
-        existing_pages = {page['page'] for page in data['content']}
-        max_page = max(existing_pages)
+        existing_pages = {page['page'] for page in data['content'] if 'page' in page}
+        if not existing_pages: # if no pages have 'page' key
+             _log.warning("No 'page' key found in content items during normalization.")
+             return data # return original data if no page numbers are found
+
+        max_page = max(existing_pages) if existing_pages else 0
         
-        # Create template for empty page
         empty_page_template = {
             "content": [],
-            "page_dimensions": {}  # or some default dimensions if needed
+            "page_dimensions": {}
         }
         
-        # Create new content array with all pages
         new_content = []
         for page_num in range(1, max_page + 1):
-            # Find existing page or create empty one
             page_content = next(
-                (page for page in data['content'] if page['page'] == page_num),
+                (page for page in data['content'] if page.get('page') == page_num),
                 {"page": page_num, **empty_page_template}
             )
             new_content.append(page_content)
@@ -158,6 +170,10 @@ class PDFParser:
         if input_doc_paths is None and doc_dir is not None:
             input_doc_paths = list(doc_dir.glob("*.pdf"))
         
+        if not input_doc_paths:
+            _log.info("No PDF documents found to process.")
+            return
+
         total_docs = len(input_doc_paths)
         _log.info(f"Starting to process {total_docs} documents")
         
@@ -167,10 +183,12 @@ class PDFParser:
 
         if failure_count > 0:
             error_message = f"Failed converting {failure_count} out of {total_docs} documents."
-            failed_docs = "Paths of failed docs:\n" + '\n'.join(str(path) for path in input_doc_paths)
+            failed_docs_paths = [str(res.input.file) for res in conv_results if res.status != ConversionStatus.SUCCESS]
+            failed_docs_log = "Paths of failed docs:\n" + '\n'.join(failed_docs_paths)
             _log.error(error_message)
-            _log.error(failed_docs)
-            raise RuntimeError(error_message)
+            _log.error(failed_docs_log)
+            # Still raise runtime error, but ensure failed_docs_paths is populated correctly
+            # raise RuntimeError(error_message) # Commenting for now to allow partial success
 
         _log.info(f"{'#'*50}\nCompleted in {elapsed_time:.2f} seconds. Successfully converted {success_count}/{total_docs} documents.\n{'#'*50}")
 
@@ -181,34 +199,27 @@ class PDFParser:
         optimal_workers: int = 10,
         chunk_size: int = None
     ):
-        """Parse PDF files in parallel using multiple processes.
-        
-        Args:
-            input_doc_paths: List of paths to PDF files to process
-            doc_dir: Directory containing PDF files (used if input_doc_paths is None)
-            optimal_workers: Number of worker processes to use. If None, uses CPU count.
-        """
         import multiprocessing
         from concurrent.futures import ProcessPoolExecutor, as_completed
 
-        # Get input paths if not provided
         if input_doc_paths is None and doc_dir is not None:
             input_doc_paths = list(doc_dir.glob("*.pdf"))
+
+        if not input_doc_paths:
+            _log.info("No PDF documents found for parallel processing.")
+            return
 
         total_pdfs = len(input_doc_paths)
         _log.info(f"Starting parallel processing of {total_pdfs} documents")
         
         cpu_count = multiprocessing.cpu_count()
         
-        # Calculate optimal workers if not specified
         if optimal_workers is None:
-            optimal_workers = min(cpu_count, total_pdfs)
+            optimal_workers = min(cpu_count, total_pdfs) if total_pdfs > 0 else 1
         
         if chunk_size is None:
-            # Calculate chunk size (ensure at least 1)
-            chunk_size = max(1, total_pdfs // optimal_workers)
+            chunk_size = max(1, total_pdfs // optimal_workers if optimal_workers > 0 else total_pdfs)
         
-        # Split documents into chunks
         chunks = [
             input_doc_paths[i : i + chunk_size]
             for i in range(0, total_pdfs, chunk_size)
@@ -217,9 +228,7 @@ class PDFParser:
         start_time = time.time()
         processed_count = 0
         
-        # Use ProcessPoolExecutor for parallel processing
         with ProcessPoolExecutor(max_workers=optimal_workers) as executor:
-            # Schedule all tasks
             futures = [
                 executor.submit(
                     _process_chunk,
@@ -227,311 +236,164 @@ class PDFParser:
                     self.pdf_backend,
                     self.output_dir,
                     self.num_threads,
-                    self.metadata_lookup,
+                    # self.metadata_lookup, # Removed
                     self.debug_data_path
                 )
                 for chunk in chunks
             ]
             
-            # Wait for completion and log results
             for future in as_completed(futures):
                 try:
                     result = future.result()
-                    processed_count += int(result.split()[1])  # Extract number from "Processed X PDFs"
+                    # Assuming result format is "Processed X PDFs."
+                    num_processed_in_chunk = int(re.search(r"Processed (\d+) PDFs", result).group(1))
+                    processed_count += num_processed_in_chunk
                     _log.info(f"{'#'*50}\n{result} ({processed_count}/{total_pdfs} total)\n{'#'*50}")
                 except Exception as e:
                     _log.error(f"Error processing chunk: {str(e)}")
-                    raise
-
+                    # raise # Decide if one failed chunk should stop all
         elapsed_time = time.time() - start_time
         _log.info(f"Parallel processing completed in {elapsed_time:.2f} seconds.")
 
 
-class JsonReportProcessor:
-    def __init__(self, metadata_lookup: dict = None, debug_data_path: Path = None):
-        self.metadata_lookup = metadata_lookup or {}
+class JsonPodcastProcessor: # Renamed from JsonReportProcessor
+    def __init__(self, debug_data_path: Path = None): # Removed metadata_lookup
+        # self.metadata_lookup = metadata_lookup or {} # Removed
         self.debug_data_path = debug_data_path
 
-    def assemble_report(self, conv_result, normalized_data=None):
-        """Assemble the report using either normalized data or raw conversion result."""
-        data = normalized_data if normalized_data is not None else conv_result.document.export_to_dict()
-        assembled_report = {}
-        assembled_report['metainfo'] = self.assemble_metainfo(data)
-        assembled_report['content'] = self.assemble_content(data)
-        assembled_report['tables'] = self.assemble_tables(conv_result.document.tables, data)
-        assembled_report['pictures'] = self.assemble_pictures(data)
-        self.debug_data(data)
-        return assembled_report
+    def assemble_podcast_json(self, conv_result: ConversionResult, raw_doc_data: Dict[str, Any]):
+        """Assemble the JSON output for a podcast transcript."""
+        podcast_json = {}
+        # Use raw_doc_data as it's already a dict from conv_result.document.export_to_dict()
+        podcast_json['metainfo'] = self._assemble_metainfo(raw_doc_data)
+        # The 'content' key in the output JSON should be a list of chunks for ingestion.py
+        podcast_json['content'] = self._assemble_content_chunks(raw_doc_data)
+
+        # Tables and Pictures are not relevant for podcasts, return empty lists.
+        podcast_json['tables'] = []
+        podcast_json['pictures'] = []
+
+        if self.debug_data_path:
+            self._debug_data(raw_doc_data) # Debug raw docling output if needed
+        return podcast_json
     
-    def assemble_metainfo(self, data):
+    def _extract_episode_info(self, texts_data: List[Dict[str, Any]]):
+        episode_number = None
+        youtube_url = None
+        # Search for episode number and URL typically in the first few text blocks
+        for text_block in texts_data[:10]: # Check first 10 text blocks
+            text = text_block.get('text', '')
+            if not episode_number:
+                match = EPISODE_TITLE_RE.search(text)
+                if match:
+                    episode_number = match.group(1)
+            if not youtube_url:
+                match = YOUTUBE_URL_RE.search(text)
+                if match:
+                    youtube_url = match.group(1)
+            if episode_number and youtube_url:
+                break
+        return episode_number, youtube_url
+
+    def _assemble_metainfo(self, doc_data: Dict[str, Any]):
         metainfo = {}
-        sha1_name = data['origin']['filename'].rsplit('.', 1)[0]
-        metainfo['sha1_name'] = sha1_name
-        metainfo['pages_amount'] = len(data.get('pages', []))
-        metainfo['text_blocks_amount'] = len(data.get('texts', []))
-        metainfo['tables_amount'] = len(data.get('tables', []))
-        metainfo['pictures_amount'] = len(data.get('pictures', []))
-        metainfo['equations_amount'] = len(data.get('equations', []))
-        metainfo['footnotes_amount'] = len([t for t in data.get('texts', []) if t.get('label') == 'footnote'])
+        # Use filename as a base for ID, can be made more robust
+        filename_stem = Path(doc_data['origin']['filename']).stem
+        metainfo['podcast_id'] = filename_stem
         
-        # Add CSV metadata if available
-        if self.metadata_lookup and sha1_name in self.metadata_lookup:
-            csv_meta = self.metadata_lookup[sha1_name]
-            metainfo['company_name'] = csv_meta['company_name']
-            
+        all_texts = doc_data.get('texts', [])
+        episode_num, youtube_url = self._extract_episode_info(all_texts)
+
+        metainfo['episode_number'] = episode_num if episode_num else 'N/A'
+        metainfo['youtube_url'] = youtube_url if youtube_url else 'N/A'
+
+        # Page count can be derived from the structure docling provides if pages are distinct entities
+        # Or by finding max page_no in text provenances.
+        # For simplicity, let's count unique page numbers from text blocks.
+        page_numbers = set()
+        if 'texts' in doc_data:
+            for text_item in doc_data['texts']:
+                if 'prov' in text_item and text_item['prov']:
+                    page_numbers.add(text_item['prov'][0]['page_no'])
+        metainfo['pages_amount'] = len(page_numbers) if page_numbers else 0
+
+        metainfo['dialogue_lines_amount'] = 0 # This will be updated after content processing
         return metainfo
 
-    def process_table(self, table_data):
-        # Implement your table processing logic here
-        return 'processed_table_content'
-
-    def debug_data(self, data):
+    def _debug_data(self, data: Dict[str, Any]):
         if self.debug_data_path is None:
             return
-        doc_name = data['name']
-        path = self.debug_data_path / f"{doc_name}.json"
+        # docling data has 'name' at the root, which is usually the filename
+        doc_name = data.get('name', Path(data['origin']['filename']).stem)
+        path = self.debug_data_path / f"{doc_name}_docling_raw.json"
         path.parent.mkdir(parents=True, exist_ok=True)    
         with path.open("w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
-    def expand_groups(self, body_children, groups):
-        expanded_children = []
-
-        for item in body_children:
-            if isinstance(item, dict) and '$ref' in item:
-                ref = item['$ref']
-                ref_type, ref_num = ref.split('/')[-2:]
-                ref_num = int(ref_num)
-
-                if ref_type == 'groups':
-                    group = groups[ref_num]
-                    group_id = ref_num
-                    group_name = group.get('name', '')
-                    group_label = group.get('label', '')
-
-                    for child in group['children']:
-                        child_copy = child.copy()
-                        child_copy['group_id'] = group_id
-                        child_copy['group_name'] = group_name
-                        child_copy['group_label'] = group_label
-                        expanded_children.append(child_copy)
-                else:
-                    expanded_children.append(item)
-            else:
-                expanded_children.append(item)
-
-        return expanded_children
-    
-    def _process_text_reference(self, ref_num, data):
-        """Helper method to process text references and create content items.
-        
-        Args:
-            ref_num (int): Reference number for the text item
-            data (dict): Document data dictionary
-            
-        Returns:
-            dict: Processed content item with text information
+    def _assemble_content_chunks(self, doc_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
-        text_item = data['texts'][ref_num]
-        item_type = text_item['label']
-        content_item = {
-            'text': text_item.get('text', ''),
-            'type': item_type,
-            'text_id': ref_num
-        }
+        Processes text blocks from docling output, parses podcast dialogue lines,
+        and returns a list of chunks, where each chunk is a dictionary
+        expected by the ingestion script (e.g., {'text': 'dialogue_line_content', 'page': N}).
+        """
+        chunks = []
+        dialogue_lines_count = 0
+
+        # docling's 'texts' field contains a list of all text blocks in the document
+        all_text_blocks = doc_data.get('texts', [])
         
-        # Add 'orig' field only if it differs from 'text'
-        orig_content = text_item.get('orig', '')
-        if orig_content != text_item.get('text', ''):
-            content_item['orig'] = orig_content
+        current_speaker = None
+        current_timestamp = None
+        accumulated_text = ""
 
-        # Add additional fields if they exist
-        if 'enumerated' in text_item:
-            content_item['enumerated'] = text_item['enumerated']
-        if 'marker' in text_item:
-            content_item['marker'] = text_item['marker']
-            
-        return content_item
-    
-    def assemble_content(self, data):
-        pages = {}
-        # Expand body children to include group references
-        body_children = data['body']['children']
-        groups = data.get('groups', [])
-        expanded_body_children = self.expand_groups(body_children, groups)
+        for text_block in all_text_blocks:
+            block_text = text_block.get('text', '').strip()
+            page_num = text_block.get('prov', [{}])[0].get('page_no', 0) # Default to 0 if not found
 
-        # Process body content
-        for item in expanded_body_children:
-            if isinstance(item, dict) and '$ref' in item:
-                ref = item['$ref']
-                ref_type, ref_num = ref.split('/')[-2:]
-                ref_num = int(ref_num)
+            if not block_text:
+                continue
 
-                if ref_type == 'texts':
-                    text_item = data['texts'][ref_num]
-                    content_item = self._process_text_reference(ref_num, data)
+            match = PODCAST_LINE_RE.match(block_text)
+            if match: # New speaker line
+                # If there was accumulated text, save it as a chunk for the previous speaker
+                if accumulated_text:
+                    chunks.append({
+                        "text": f"[{current_timestamp}] {current_speaker}: {accumulated_text.strip()}",
+                        "speaker": current_speaker,
+                        "timestamp": current_timestamp,
+                        "page": page_num # This might be tricky if dialogue spans pages, use page of start
+                    })
+                    dialogue_lines_count +=1
+                    accumulated_text = "" # Reset accumulator
 
-                    # Add group information if available
-                    if 'group_id' in item:
-                        content_item['group_id'] = item['group_id']
-                        content_item['group_name'] = item['group_name']
-                        content_item['group_label'] = item['group_label']
-
-                    # Get page number from prov
-                    if 'prov' in text_item and text_item['prov']:
-                        page_num = text_item['prov'][0]['page_no']
-
-                        # Initialize page if not exists
-                        if page_num not in pages:
-                            pages[page_num] = {
-                                'page': page_num,
-                                'content': [],
-                                'page_dimensions': text_item['prov'][0].get('bbox', {})
-                            }
-
-                        pages[page_num]['content'].append(content_item)
-
-                elif ref_type == 'tables':
-                    table_item = data['tables'][ref_num]
-                    content_item = {
-                        'type': 'table',
-                        'table_id': ref_num
-                    }
-
-                    if 'prov' in table_item and table_item['prov']:
-                        page_num = table_item['prov'][0]['page_no']
-
-                        if page_num not in pages:
-                            pages[page_num] = {
-                                'page': page_num,
-                                'content': [],
-                                'page_dimensions': table_item['prov'][0].get('bbox', {})
-                            }
-
-                        pages[page_num]['content'].append(content_item)
-                
-                elif ref_type == 'pictures':
-                    picture_item = data['pictures'][ref_num]
-                    content_item = {
-                        'type': 'picture',
-                        'picture_id': ref_num
-                    }
-                    
-                    if 'prov' in picture_item and picture_item['prov']:
-                        page_num = picture_item['prov'][0]['page_no']
-
-                        if page_num not in pages:
-                            pages[page_num] = {
-                                'page': page_num,
-                                'content': [],
-                                'page_dimensions': picture_item['prov'][0].get('bbox', {})
-                            }
-                        
-                        pages[page_num]['content'].append(content_item)
-
-        sorted_pages = [pages[page_num] for page_num in sorted(pages.keys())]
-        return sorted_pages
-
-    def assemble_tables(self, tables, data):
-        assembled_tables = []
-        for i, table in enumerate(tables):
-            table_json_obj = table.model_dump()
-            table_md = self._table_to_md(table_json_obj)
-            table_html = table.export_to_html()
-            
-            table_data = data['tables'][i]
-            table_page_num = table_data['prov'][0]['page_no']
-            table_bbox = table_data['prov'][0]['bbox']
-            table_bbox = [
-                table_bbox['l'],
-                table_bbox['t'], 
-                table_bbox['r'],
-                table_bbox['b']
-            ]
-            
-            # Get rows and columns from the table data structure
-            nrows = table_data['data']['num_rows']
-            ncols = table_data['data']['num_cols']
-
-            ref_num = table_data['self_ref'].split('/')[-1]
-            ref_num = int(ref_num)
-
-            table_obj = {
-                'table_id': ref_num,
-                'page': table_page_num,
-                'bbox': table_bbox,
-                '#-rows': nrows,
-                '#-cols': ncols,
-                'markdown': table_md,
-                'html': table_html,
-                'json': table_json_obj
-            }
-            assembled_tables.append(table_obj)
-        return assembled_tables
-
-    def _table_to_md(self, table):
-        # Extract text from grid cells
-        table_data = []
-        for row in table['data']['grid']:
-            table_row = [cell['text'] for cell in row]
-            table_data.append(table_row)
+                current_timestamp, current_speaker, text_after_speaker = match.groups()
+                current_speaker = current_speaker.strip()
+                accumulated_text = text_after_speaker.strip()
+            else: # Continuation of the previous speaker's dialogue
+                if current_speaker: # Only append if we are in a speaker block
+                    accumulated_text += " " + block_text
         
-        # Check if the table has headers
-        if len(table_data) > 1 and len(table_data[0]) > 0:
-            try:
-                md_table = tabulate(
-                    table_data[1:], headers=table_data[0], tablefmt="github"
-                )
-            except ValueError:
-                md_table = tabulate(
-                    table_data[1:],
-                    headers=table_data[0],
-                    tablefmt="github",
-                    disable_numparse=True,
-                )
-        else:
-            md_table = tabulate(table_data, tablefmt="github")
-        
-        return md_table
+        # Add any remaining accumulated text as the last chunk
+        if accumulated_text and current_speaker:
+            chunks.append({
+                "text": f"[{current_timestamp}] {current_speaker}: {accumulated_text.strip()}",
+                "speaker": current_speaker,
+                "timestamp": current_timestamp,
+                "page": page_num # Page of the last text block processed for this segment
+            })
+            dialogue_lines_count +=1
 
-    def assemble_pictures(self, data):
-        assembled_pictures = []
-        for i, picture in enumerate(data['pictures']):
-            children_list = self._process_picture_block(picture, data)
-            
-            ref_num = picture['self_ref'].split('/')[-1]
-            ref_num = int(ref_num)
-            
-            picture_page_num = picture['prov'][0]['page_no']
-            picture_bbox = picture['prov'][0]['bbox']
-            picture_bbox = [
-                picture_bbox['l'],
-                picture_bbox['t'], 
-                picture_bbox['r'],
-                picture_bbox['b']
-            ]
-            
-            picture_obj = {
-                'picture_id': ref_num,
-                'page': picture_page_num,
-                'bbox': picture_bbox,
-                'children': children_list,
-            }
-            assembled_pictures.append(picture_obj)
-        return assembled_pictures
-    
-    def _process_picture_block(self, picture, data):
-        children_list = []
+        # Update dialogue lines count in metainfo (if we want to pass metainfo around or log it)
+        # For now, the ingestion script only needs the list of chunks.
+        # If metainfo needs to be updated, it would require passing it here or returning it.
+        # _log.info(f"Extracted {dialogue_lines_count} dialogue lines as chunks.")
         
-        for item in picture['children']:
-            if isinstance(item, dict) and '$ref' in item:
-                ref = item['$ref']
-                ref_type, ref_num = ref.split('/')[-2:]
-                ref_num = int(ref_num)
-                
-                if ref_type == 'texts':
-                    content_item = self._process_text_reference(ref_num, data)
-                        
-                    children_list.append(content_item)
+        # The ingestion script (BM25Ingestor, VectorDBIngestor) expects each item in
+        # report_data['content']['chunks'] to be a dict with at least a 'text' key.
+        # Our chunks are already in this format.
+        return chunks
 
-        return children_list
+    # Methods like expand_groups, _process_text_reference, assemble_tables, _table_to_md,
+    # assemble_pictures, _process_picture_block are removed as they are specific to
+    # the previous report structure and not needed for podcast transcripts.
+    # The new _assemble_content_chunks focuses on parsing the specific podcast format.
