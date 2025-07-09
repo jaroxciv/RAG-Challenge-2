@@ -173,7 +173,7 @@ class VectorDBIngestor:
         for json_path in tqdm(all_json_paths, desc="Processing documents for VectorDB"):
             try:
                 with open(json_path, 'r', encoding='utf-8') as file:
-                    doc_data = json.load(f) # Renamed report_data to doc_data
+                    doc_data = json.load(file) # Renamed report_data to doc_data
 
                 index = self._process_document(doc_data)
                 if index is None: # Skip if index creation failed (e.g. no text, no embeddings)
