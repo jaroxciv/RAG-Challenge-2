@@ -2,176 +2,175 @@ import json
 from typing import Union, Dict, List, Optional
 import re
 from pathlib import Path
-from src.retrieval import VectorRetriever, HybridRetriever # Assuming these will be adapted or are generic enough
+# Corrected import: HybridRetriever now likely lives in retrieval.py, not a submodule.
+from src.retrieval import HybridRetriever # VectorRetriever might be used by HybridRetriever internally
 from src.api_requests import APIProcessor
 from tqdm import tqdm
-import pandas as pd # May not be needed if subset_path is removed for podcasts
+# import pandas as pd # No longer needed for podcast flow
 import threading
 import concurrent.futures
+import logging # Make sure logging is imported
+
+_log = logging.getLogger(__name__) # Initialize logger for this module
 
 
 class QuestionsProcessor:
     def __init__(
         self,
-        vector_db_dir: Union[str, Path] = './vector_dbs', # Will point to podcast vector DBs
-        documents_dir: Union[str, Path] = './documents', # Will point to processed podcast JSONs
+        vector_db_dir: Union[str, Path], # Made required
+        documents_dir: Union[str, Path], # Made required
+        bm25_db_dir: Optional[Union[str, Path]] = None, # For HybridRetriever
         questions_file_path: Optional[Union[str, Path]] = None,
-        processing_flow: str = "podcast", # Replaces new_challenge_pipeline, e.g., "podcast" or "annual_report"
-        # subset_path: Optional[Union[str, Path]] = None, # Making this optional for podcasts
-        podcast_metadata_file: Optional[Union[str, Path]] = None, # Example: for mapping episode names to IDs
+        processing_flow: str = "podcast",
+        podcast_metadata_file: Optional[Union[str, Path]] = None,
         parent_document_retrieval: bool = False,
-        llm_reranking: bool = False,
+        llm_reranking: bool = True, # Defaulting to True for HybridRetriever
         llm_reranking_sample_size: int = 20,
-        top_n_retrieval: int = 10,
+        top_n_retrieval: int = 5, # Top N after reranking or direct retrieval
+        top_n_per_doc_for_cross_search: int = 3, # For search_across_all_podcasts
         parallel_requests: int = 10,
         api_provider: str = "openai",
         answering_model: str = "gpt-4o-2024-08-06",
-        full_context: bool = False
+        full_context: bool = False # For get_answer_for_podcast_entity
     ):
         self.questions = self._load_questions(questions_file_path)
         self.documents_dir = Path(documents_dir)
         self.vector_db_dir = Path(vector_db_dir)
-        # self.subset_path = Path(subset_path) if subset_path else None # Keep for now, but make usage conditional
+        self.bm25_db_dir = Path(bm25_db_dir) if bm25_db_dir else None
         self.podcast_metadata_file = Path(podcast_metadata_file) if podcast_metadata_file else None
-        self.processing_flow = processing_flow # "podcast" or "annual_report" (or other future flows)
+        self.processing_flow = processing_flow
         
         self.return_parent_pages = parent_document_retrieval
-        self.llm_reranking = llm_reranking
-        self.llm_reranking_sample_size = llm_reranking_sample_size
-        self.top_n_retrieval = top_n_retrieval
+        self.llm_reranking = llm_reranking # This flag will control HybridRetriever's behavior
+        self.llm_reranking_sample_size = llm_reranking_sample_size # For HybridRetriever single doc
+        self.top_n_retrieval = top_n_retrieval # Final N for single doc or cross-search
+        self.top_n_per_doc_for_cross_search = top_n_per_doc_for_cross_search
+
         self.answering_model = answering_model
         self.parallel_requests = parallel_requests
         self.api_provider = api_provider
         self.openai_processor = APIProcessor(provider=api_provider)
         self.full_context = full_context
 
+        # Initialize retriever - assuming HybridRetriever is the main one
+        # HybridRetriever can decide internally whether to use BM25 or just Vector based on its config/params
+        self.retriever = HybridRetriever(
+            vector_db_dir=self.vector_db_dir,
+            documents_dir=self.documents_dir,
+            bm25_db_dir=self.bm25_db_dir # Pass BM25 dir
+        )
+
         self.answer_details = []
-        # self.detail_counter = 0 # Not used
         self._lock = threading.Lock()
 
         if self.podcast_metadata_file and self.podcast_metadata_file.exists():
-            # Example: Load podcast metadata if provided (e.g., episode title to ID mapping)
-            # with open(self.podcast_metadata_file, 'r') as f:
-            #     self.podcast_metadata = json.load(f)
-            pass
+            try:
+                with open(self.podcast_metadata_file, 'r', encoding='utf-8') as f:
+                    self.podcast_metadata = json.load(f) # E.g. {"episode_101_official_title": "episode_101_doc_id", ...}
+            except Exception as e:
+                _log.error(f"Failed to load podcast metadata from {self.podcast_metadata_file}: {e}")
+                self.podcast_metadata = None
 
 
     def _load_questions(self, questions_file_path: Optional[Union[str, Path]]) -> List[Dict[str, str]]:
         if questions_file_path is None:
+            _log.warning("No questions file path provided.")
             return []
-        with open(questions_file_path, 'r', encoding='utf-8') as file:
-            return json.load(file)
+        try:
+            with open(questions_file_path, 'r', encoding='utf-8') as file:
+                return json.load(file)
+        except FileNotFoundError:
+            _log.error(f"Questions file not found: {questions_file_path}")
+            return []
+        except json.JSONDecodeError as e:
+            _log.error(f"Error decoding JSON from questions file {questions_file_path}: {e}")
+            return []
 
-    def _format_retrieval_results(self, retrieval_results) -> str:
-        """Format vector retrieval results into RAG context string."""
+
+    def _format_retrieval_results(self, retrieval_results: List[Dict]) -> str:
+        """Format retrieval results (list of chunk dicts) into RAG context string."""
         if not retrieval_results:
-            return ""
+            return "No relevant context found."
         
         context_parts = []
-        for result in retrieval_results:
-            page_number = result.get('page', 'N/A') # podcast chunks might have page numbers
-            text = result['text']
-            # Include speaker and timestamp if available in the chunk from pdf_parsing
-            speaker = result.get('speaker')
-            timestamp = result.get('timestamp')
-            prefix = ""
-            if speaker and timestamp:
-                prefix = f"From page {page_number}, at {timestamp}, {speaker} said: "
-            elif speaker:
-                prefix = f"From page {page_number}, {speaker} said: "
-            elif page_number != 'N/A':
-                prefix = f"Text retrieved from page {page_number}: "
-            else:
-                prefix = "Retrieved text: "
+        for i, result in enumerate(retrieval_results):
+            text = result.get('text', '')
+            # Metadata from our adapted retrievers
+            source_id = result.get('podcast_id', result.get('document_id', 'UnknownSource'))
+            page_number = result.get('page', result.get('original_page', 'N/A'))
+            speaker = result.get('speaker', result.get('original_speaker'))
+            timestamp = result.get('timestamp', result.get('original_timestamp'))
+
+            prefix = f"Context Segment {i+1} (Source: {source_id}, Page: {page_number}"
+            if speaker:
+                prefix += f", Speaker: {speaker}"
+            if timestamp:
+                prefix += f", Timestamp: {timestamp}"
+            prefix += "):"
 
             context_parts.append(f'{prefix}\n"""\n{text}\n"""')
             
         return "\n\n---\n\n".join(context_parts)
 
-    def _extract_references(self, pages_list: list, podcast_identifier: str) -> list:
+    def _extract_references_from_results(self, llm_pages_list: List[Any], retrieval_results: List[Dict], default_identifier: Optional[str] = None) -> List[Dict]:
         """
-        Create reference list for a podcast.
-        `podcast_identifier` is the unique ID of the podcast document (e.g., filename stem).
+        Create reference list based on LLM's claimed pages and actual retrieved results.
+        Handles cases where llm_pages_list might contain simple page numbers (for single doc query)
+        or more complex structures if LLM indicates source_ids.
         """
         refs = []
-        for page in pages_list:
-            # The 'podcast_id' should match the identifier used when saving the parsed JSON
-            # and when creating vector DBs (e.g., 'episode_90').
-            refs.append({"podcast_id": podcast_identifier, "page_index": page})
+        # If LLM gives simple page numbers, assume they relate to `default_identifier` or the main doc queried.
+        # If LLM gives dicts like {'podcast_id': 'id', 'page': X}, use that.
+        
+        # For now, a simplified approach: extract unique (podcast_id, page) from retrieval_results
+        # that correspond to pages mentioned by LLM or are generally top retrieved pages.
+        # This needs to be more robust based on how LLM `relevant_pages` is structured.
+        
+        # Let's assume llm_pages_list contains page numbers relevant to the primary context.
+        # If retrieval_results came from multiple podcast_ids (cross-search), this is more complex.
+        
+        # Simplification: If default_identifier is given (single-doc query), use that.
+        if default_identifier and isinstance(llm_pages_list, list) and all(isinstance(p, int) for p in llm_pages_list):
+            for page_num in llm_pages_list:
+                refs.append({"podcast_id": default_identifier, "page_index": page_num})
+            return refs
+
+        # If general query, try to get (podcast_id, page) from the top retrieved chunks
+        # that the LLM *might* have used. LLM's `relevant_pages` for multi-source is hard.
+        # For now, just list references from the top N actually retrieved chunks.
+        # This is a placeholder for better reference extraction from multi-source LLM answers.
+        added_refs = set()
+        for res_chunk in retrieval_results[:5]: # Take top 5 retrieved as potential references
+            pid = res_chunk.get('podcast_id', default_identifier)
+            pnum = res_chunk.get('page', res_chunk.get('original_page'))
+            if pid and pnum is not None:
+                ref_tuple = (pid, pnum)
+                if ref_tuple not in added_refs:
+                    refs.append({"podcast_id": pid, "page_index": pnum})
+                    added_refs.add(ref_tuple)
         return refs
 
-    def _validate_page_references(self, claimed_pages: list, retrieval_results: list, min_pages: int = 1, max_pages: int = 8) -> list:
-        """
-        Validate that all page numbers mentioned in the LLM's answer are actually from the retrieval results.
-        If fewer than min_pages valid references remain, add top pages from retrieval results.
-        """
-        if not claimed_pages: # Handles None or empty list
-            claimed_pages = []
-        
-        # Ensure retrieval_results and its items are valid before list comprehension
-        if not retrieval_results or not all(isinstance(r, dict) and 'page' in r for r in retrieval_results):
-             _log.warning("Invalid retrieval_results for page validation.")
-             retrieved_pages = []
-        else:
-            retrieved_pages = [result['page'] for result in retrieval_results]
-        
-        validated_pages = [page for page in claimed_pages if page in retrieved_pages]
-        
-        if len(validated_pages) < len(claimed_pages):
-            removed_pages = set(claimed_pages) - set(validated_pages)
-            print(f"Warning: Removed {len(removed_pages)} hallucinated page references: {list(removed_pages)}")
-        
-        # Ensure at least min_pages if possible
-        if len(validated_pages) < min_pages and retrieval_results:
-            existing_pages = set(validated_pages)
-            for result in retrieval_results:
-                page = result.get('page')
-                if page is not None and page not in existing_pages:
-                    validated_pages.append(page)
-                    existing_pages.add(page)
-                    if len(validated_pages) >= min_pages:
-                        break
-        
-        # Trim to max_pages
-        if len(validated_pages) > max_pages:
-            print(f"Trimming references from {len(validated_pages)} to {max_pages} pages")
-            validated_pages = validated_pages[:max_pages]
-        
-        return validated_pages
 
     def get_answer_for_podcast_entity(self, podcast_identifier: str, question: str, schema: str) -> dict:
         """
-        Retrieves an answer for a question about a specific podcast entity (e.g., an episode).
-        `podcast_identifier` is used to fetch the correct document context.
+        Retrieves an answer for a question about a specific podcast entity.
         """
-        if self.llm_reranking:
-            retriever = HybridRetriever( # Assuming retriever is adapted for podcast_identifier
-                vector_db_dir=self.vector_db_dir,
-                documents_dir=self.documents_dir
-            )
-        else:
-            retriever = VectorRetriever( # Assuming retriever is adapted for podcast_identifier
-                vector_db_dir=self.vector_db_dir,
-                documents_dir=self.documents_dir
-            )
-
+        # self.retriever is HybridRetriever instance
+        retrieval_results = []
         if self.full_context:
-            # `retrieve_all` in retriever needs to know how to get all chunks for `podcast_identifier`
-            retrieval_results = retriever.retrieve_all(podcast_identifier)
+            retrieval_results = self.retriever.vector_retriever.retrieve_all(document_id=podcast_identifier)
         else:           
-            # `retrieve_by_identifier` (new name proposal) in retriever
-            retrieval_results = retriever.retrieve_by_identifier(
-                identifier=podcast_identifier, # Changed from company_name
+            retrieval_results = self.retriever.retrieve_by_document_id(
+                document_id=podcast_identifier,
                 query=question,
-                llm_reranking_sample_size=self.llm_reranking_sample_size,
-                top_n=self.top_n_retrieval,
-                return_parent_pages=self.return_parent_pages # This might mean full sentences or paragraphs for podcasts
+                llm_reranking_sample_size=self.llm_reranking_sample_size, # Used by Hybrid for initial pool
+                top_n=self.top_n_retrieval, # Final N from Hybrid
+                return_parent_pages=self.return_parent_pages,
+                # HybridRetriever decides internally if it uses BM25 based on its own state
             )
         
         if not retrieval_results:
-            # Consider returning a specific dict or N/A instead of raising ValueError immediately
-            # to allow graceful handling in _process_single_question
-            return {"error": "No relevant context found", "final_answer": "N/A", "relevant_pages": [], "references": []}
+            return {"error": f"No relevant context found for '{podcast_identifier}'", "final_answer": "N/A", "relevant_pages": [], "references": []}
 
         rag_context = self._format_retrieval_results(retrieval_results)
         answer_dict = self.openai_processor.get_answer_from_rag_context(
@@ -180,105 +179,118 @@ class QuestionsProcessor:
             schema=schema,
             model=self.answering_model
         )
-        self.response_data = self.openai_processor.response_data # Store last API response data
+        self.response_data = self.openai_processor.response_data
 
-        # Reference handling for podcasts
-        if self.processing_flow == "podcast": # or a similar flag indicating podcast mode
-            pages = answer_dict.get("relevant_pages", [])
-            validated_pages = self._validate_page_references(pages, retrieval_results)
-            answer_dict["relevant_pages"] = validated_pages
-            # `podcast_identifier` is the ID of the document being queried (e.g., "episode_90_transcript")
-            answer_dict["references"] = self._extract_references(validated_pages, podcast_identifier)
+        if self.processing_flow == "podcast":
+            llm_pages = answer_dict.get("relevant_pages", [])
+            # Validate pages against those in retrieval_results for this specific podcast_identifier
+            # This validation might need access to the specific pages retrieved for this entity.
+            # For now, _validate_page_references might be too generic if llm_pages are just numbers.
+            # validated_pages = self._validate_page_references(llm_pages, retrieval_results)
+            # answer_dict["relevant_pages"] = validated_pages
+            # References are for this specific podcast_identifier
+            answer_dict["references"] = self._extract_references_from_results(llm_pages, retrieval_results, podcast_identifier)
         return answer_dict
 
     def _extract_podcast_entities_from_question(self, question_text: str) -> list[str]:
-        """
-        Extracts podcast entity identifiers (e.g., "Episode 101", "The Daily Show") from a question.
-        This is a simplified version and can be made more robust.
-        """
-        # Attempt to find "Episode XXX" patterns
+        # This logic remains largely the same as before.
+        # It tries to find "Episode XXX" or quoted strings.
+        # If self.podcast_metadata exists, it could be used to map friendly names to doc_ids.
         episode_matches = re.findall(r"Episode\s+(\d+)", question_text, re.IGNORECASE)
-        entities = [f"Episode {num}" for num in episode_matches]
+        # Attempt to map "Episode XXX" to a known document ID format if necessary
+        # For now, assume "Episode XXX" might be a direct or transformable ID.
+        # Example: if doc IDs are "episode_XXX", then transform.
+        # This part needs to align with how document IDs are stored and expected by retriever.
+        # Let's assume for now the extracted entities are usable as document_ids or can be mapped.
+
+        entities = [f"Episode {num}" for num in episode_matches] # Or transform to "episode_{num}"
         
-        # Attempt to find quoted strings as potential podcast titles or series names
         quoted_matches = re.findall(r'"([^"]*)"', question_text)
         for qm in quoted_matches:
             # Avoid adding if it's just the episode number part already captured
-            if not any(qm.endswith(ep.split()[-1]) for ep in entities if "Episode" in ep):
+            # or if it's a very short, non-descriptive quote.
+            is_part_of_episode_match = any(qm.lower().endswith(ep.lower().split()[-1]) for ep in entities if "Episode" in ep)
+            if not is_part_of_episode_match and len(qm) > 3: # Basic filter for short quotes
                 entities.append(qm)
         
-        # If we have podcast metadata, try to match known titles/series
-        # if hasattr(self, 'podcast_metadata') and self.podcast_metadata:
-        #     for title_or_id in self.podcast_metadata.keys(): # or iterate through a list of known entities
-        #         if title_or_id.lower() in question_text.lower() and title_or_id not in entities:
-        #             entities.append(title_or_id)
+        # If using podcast_metadata for mapping friendly names to actual document_ids:
+        if hasattr(self, 'podcast_metadata') and self.podcast_metadata:
+            # This metadata would be like: {"My Cool Podcast Episode Title": "podcast_file_stem_id_123"}
+            # Or {"episode_101": "ep_101_doc_id"}
+            # This step is crucial for robust entity linking.
+            # For now, this is a placeholder for a more complex entity linking step.
+            pass
 
-        # Basic fallback: if no specific entities found, maybe the question is general
-        # or implies a single known podcast if only one is loaded.
-        # For now, we require some identifiable entity.
-        
-        # Remove duplicates if any were added by different methods
         unique_entities = []
-        for entity in entities:
-            if entity not in unique_entities:
-                unique_entities.append(entity)
-        
+        [unique_entities.append(x) for x in entities if x not in unique_entities]
         return unique_entities
 
-    def process_question(self, question_text: str, schema: str): # Renamed question to question_text for clarity
+
+    def process_question(self, question_text: str, schema: str):
+        extracted_entities = []
+        is_general_query = False
+
         if self.processing_flow == "podcast":
             extracted_entities = self._extract_podcast_entities_from_question(question_text)
-        # elif self.processing_flow == "annual_report" and self.subset_path: # Example for old flow
-            # extracted_entities = self._extract_companies_from_subset(question_text)
-        else: # Default to quoted string extraction if no specific flow or method
+            # Determine if it's a general query
+            # Simple heuristic: if no specific entities found, or question contains keywords like "any podcasts", "which episodes"
+            if not extracted_entities or \
+               any(kw in question_text.lower() for kw in ["any podcast", "which episode", "suggest podcast"]):
+                is_general_query = True
+                _log.info(f"Treating as general query: {question_text}")
+        else: # Fallback for other flows or if entity extraction is different
             extracted_entities = re.findall(r'"([^"]*)"', question_text)
+            if not extracted_entities: # If still no entities, could be general for other flows too
+                is_general_query = True # Or handle based on flow-specific rules
 
-        if not extracted_entities:
-            # If no entities are extracted, and the question might be general (e.g. "Any podcasts about AI?")
-            # We might need a way to query across all documents or a default document.
-            # For now, let's assume questions target specific entities or will be handled by a general search.
-            # This behavior might need refinement based on how general queries are intended to work.
-            # If a single podcast is the context, we can use its ID.
-            # For now, let's raise an error or return N/A if no entity is clearly targeted.
-             _log.warning(f"No specific podcast entity found in question: '{question_text}'. Further logic needed for general queries.")
-             # Fallback: if there's only one document in documents_dir, assume it's the target.
-             # This is a simplistic assumption for single-document context.
-             # For now, let's return an error state that can be handled.
-             return {"error": "No specific podcast entity identified in the question.", "final_answer": "N/A"}
+        if is_general_query and self.processing_flow == "podcast":
+            # Handle general query across all podcasts
+            retrieval_results = self.retriever.search_across_all_podcasts(
+                query=question_text,
+                top_n_overall=self.top_n_retrieval, # Use top_n_retrieval for final output count
+                top_n_per_doc=self.top_n_per_doc_for_cross_search,
+                rerank_with_llm=self.llm_reranking
+            )
+            if not retrieval_results:
+                return {"error": "No relevant context found across any podcasts.", "final_answer": "N/A", "relevant_pages": [], "references": []}
 
-
-        if len(extracted_entities) == 1:
-            entity_identifier = extracted_entities[0]
-            # We need to map this extracted entity (e.g., "Episode 102") to the actual document ID
-            # used by the retriever (e.g., "episode_102_transcript.json").
-            # This mapping might involve checking self.documents_dir or using self.podcast_metadata
-            # For simplicity, let's assume the extracted_identifier is directly usable or can be transformed.
-            # TODO: Implement robust mapping from extracted entity to document ID.
-            # For now, assume entity_identifier can be used if it matches a file stem.
-
-            # Simplified: try to match entity_identifier (e.g., "Episode 102") to a file stem.
-            # A better approach would be a metadata lookup.
-            doc_id_to_use = None
-            potential_id_transformed = entity_identifier.lower().replace(" ", "_") # e.g. "episode_102"
-
-            # Check if a JSON file matching this transformed ID exists in documents_dir
-            # This assumes processed JSONs are named like 'episode_102.json'
-            # and vector DBs are also named similarly.
-            # This part is crucial and needs to align with how ingestion names files/DBs.
-
-            # Iterate through document directory to find a match (this is inefficient for many docs)
-            # A direct lookup or naming convention is better.
-            # For now, let's assume the retriever can handle identifiers like "Episode 102"
-            # or that the identifier matches a filename stem.
-            # The retriever's `retrieve_by_identifier` will need to resolve this.
-            doc_id_to_use = entity_identifier # Pass it to the retriever to handle.
-
-            answer_dict = self.get_answer_for_podcast_entity(doc_id_to_use, question_text, schema)
+            rag_context = self._format_retrieval_results(retrieval_results)
+            # Schema for general queries might be "text" or a specific "suggestion" schema
+            # For now, use the provided schema, but this might need a dedicated "suggestion" schema/prompt
+            answer_dict = self.openai_processor.get_answer_from_rag_context(
+                question=question_text,
+                rag_context=rag_context,
+                schema=schema, # Or a specific schema like "podcast_suggestion_list"
+                model=self.answering_model
+            )
+            self.response_data = self.openai_processor.response_data
+            # References for general queries:
+            llm_pages = answer_dict.get("relevant_pages", []) # This is tricky for multi-source
+            answer_dict["references"] = self._extract_references_from_results(llm_pages, retrieval_results)
+            answer_dict["retrieved_chunks_for_general_query"] = retrieval_results # For debugging/inspection
             return answer_dict
-        else: # Comparative question
-            # For comparative, the extracted_entities should be usable by process_comparative_question
+
+        elif len(extracted_entities) == 1:
+            # This part requires mapping the extracted entity name (e.g., "Episode 101")
+            # to the actual document ID used by the retriever (e.g., "episode_101_filename_stem").
+            # This is a CRITICAL step. For now, assume direct use or simple transformation.
+            entity_identifier = extracted_entities[0]
+            # TODO: Implement robust mapping from extracted_entity_name to actual_document_id
+            # e.g., using self.podcast_metadata or by scanning document filenames.
+            # Simple placeholder: transform "Episode 101" to "episode_101" if that's the doc ID pattern.
+            # This needs to be consistent with how `podcast_id` is set in ingestion and `TextSplitter`.
+            # Let's assume the entity_identifier is directly usable for now.
+            actual_doc_id = entity_identifier # This is a placeholder for a real mapping
+
+            return self.get_answer_for_podcast_entity(actual_doc_id, question_text, schema)
+
+        elif len(extracted_entities) > 1: # Comparative question
             return self.process_comparative_question(question_text, extracted_entities, schema)
-    
+
+        else: # Should have been caught by is_general_query or entity extraction
+             _log.error(f"Unhandled case in process_question for: '{question_text}'")
+             return {"error": "Could not determine how to process the question.", "final_answer": "N/A"}
+
     def _create_answer_detail_ref(self, answer_dict: dict, question_index: int) -> str:
         """Create a reference ID for answer details and store the details."""
         ref_id = f"#/answer_details/{question_index}"

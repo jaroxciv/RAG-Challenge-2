@@ -321,6 +321,104 @@ Answer:
     system_prompt_with_schema = build_system_prompt(instruction, example, pydantic_schema)
 
 
+class RelevantSource(BaseModel):
+    """Identifies a relevant source document and specific pages within it."""
+    podcast_id: str = Field(description="The unique identifier of the podcast episode or document.")
+    relevant_pages: List[int] = Field(description="List of page numbers within this specific podcast that are relevant to the answer.")
+
+class PodcastEpisodeSuggestion(BaseModel):
+    """Represents a suggested podcast episode with a summary."""
+    podcast_id: str = Field(description="The unique identifier of the suggested podcast episode (e.g., 'episode_90', 'tech_podcast_ep123').")
+    episode_title: Optional[str] = Field(default=None, description="The title of the podcast episode, if known or inferable from context or metainfo.")
+    summary: str = Field(description="A brief summary (1-2 sentences) of why this episode is relevant to the query, based on the provided context segments.")
+    # youtube_url: Optional[str] = Field(default=None, description="The YouTube URL for the episode, if available in context or metainfo.") # This might be hard for LLM to get reliably
+
+class AnswerWithRAGContextMultiSourceListPrompt:
+    instruction = """
+You are a RAG (Retrieval-Augmented Generation) answering system.
+Your task is to answer the given question by synthesizing information from multiple podcast transcript segments, potentially from different episodes.
+The context provided will have segments clearly marked with their source (e.g., "Source: podcast_id, Page: X...").
+Your goal is to identify relevant podcast episodes and summarize their contribution to answering the question.
+"""
+    user_prompt = AnswerWithRAGContextSharedPrompt.user_prompt # Use the same user prompt structure
+
+    class AnswerSchema(BaseModel):
+        step_by_step_analysis: str = Field(description="Detailed step-by-step analysis. Explain how you identified relevant information from different sources in the context and how they contribute to the answer. Mention specific podcast_ids and page numbers.")
+        reasoning_summary: str = Field(description="Concise summary of the reasoning process, highlighting which sources were most important.")
+        relevant_sources: List[RelevantSource] = Field(description="A list of all source documents (podcast_ids) and the specific page numbers within each source that contributed to the answer. This should be derived from the 'Source: ... Page: X' markers in the context.")
+        final_answer: Union[List[PodcastEpisodeSuggestion], Literal["N/A"]] = Field(description="A list of suggested podcast episodes. Each suggestion should include the podcast_id, an optional episode_title, and a brief summary of its relevance. If no episodes are relevant or information is not found, return 'N/A'.")
+
+    pydantic_schema = inspect.cleandoc(f"""
+class RelevantSource(BaseModel):
+    podcast_id: str
+    relevant_pages: List[int]
+
+class PodcastEpisodeSuggestion(BaseModel):
+    podcast_id: str
+    episode_title: Optional[str]
+    summary: str
+
+class AnswerSchema(BaseModel):
+    step_by_step_analysis: str
+    reasoning_summary: str
+    relevant_sources: List[RelevantSource]
+    final_answer: Union[List[PodcastEpisodeSuggestion], Literal['N/A']]
+""")
+
+    example = r"""
+Example:
+Question:
+"Which podcast episodes discuss 'ethical AI considerations'?"
+
+Context:
+Context Segment 1 (Source: episode_42_AIethics, Page: 5, Speaker: Dr. Ada, Timestamp: [00:10:05.00]):
+\"\"\"
+Dr. Ada: ...we must consider the ethical implications of AI in decision-making. Bias in training data is a huge concern...
+\"\"\"
+
+---
+
+Context Segment 2 (Source: another_podcast_ep_003, Page: 12, Speaker: TechGuru, Timestamp: [00:30:15.00]):
+\"\"\"
+TechGuru: ...another key aspect of ethical AI is transparency. Users need to understand how AI arrives at its conclusions...
+\"\"\"
+
+---
+
+Context Segment 3 (Source: startup_stories_ep10, Page: 2, Speaker: FounderX, Timestamp: [00:05:00.00]):
+\"\"\"
+FounderX: ...our main challenge was product-market fit, not really the deep tech ethics at that stage...
+\"\"\"
+
+Answer:
+```json
+{{
+  "step_by_step_analysis": "1. The question asks for podcast episodes discussing 'ethical AI considerations'.\n2. Context Segment 1 from 'episode_42_AIethics', page 5, directly mentions 'ethical implications of AI' and 'bias in training data'. This is highly relevant.\n3. Context Segment 2 from 'another_podcast_ep_003', page 12, discusses 'ethical AI' and 'transparency'. This is also highly relevant.\n4. Context Segment 3 from 'startup_stories_ep10', page 2, mentions that AI ethics was NOT their main challenge, so this source is less directly relevant for a positive discussion of ethical AI considerations, but notes its absence for that particular case.\n5. Based on segments 1 and 2, episodes 'episode_42_AIethics' and 'another_podcast_ep_003' are relevant.",
+  "reasoning_summary": "Identified 'episode_42_AIethics' (page 5) and 'another_podcast_ep_003' (page 12) as directly discussing ethical AI topics like bias and transparency. 'startup_stories_ep10' was deemed less relevant.",
+  "relevant_sources": [
+    {{"podcast_id": "episode_42_AIethics", "relevant_pages": [5]}},
+    {{"podcast_id": "another_podcast_ep_003", "relevant_pages": [12]}}
+  ],
+  "final_answer": [
+    {{
+      "podcast_id": "episode_42_AIethics",
+      "episode_title": "AI Ethics Deep Dive (Episode 42)",
+      "summary": "Discusses ethical implications of AI in decision-making, focusing on bias in training data."
+    }},
+    {{
+      "podcast_id": "another_podcast_ep_003",
+      "episode_title": "Tech Insights (Episode 3)",
+      "summary": "Covers the importance of transparency in ethical AI systems."
+    }}
+  ]
+}}
+```
+"""
+    # Note: Added dummy episode_title in example output as LLM might infer or be given it.
+    system_prompt = build_system_prompt(instruction, example, pydantic_schema)
+    system_prompt_with_schema = build_system_prompt(instruction, example, pydantic_schema)
+
+
 class AnswerSchemaFixPrompt: # This prompt seems generally applicable, no major changes needed.
     system_prompt = """
 You are a JSON formatter.
