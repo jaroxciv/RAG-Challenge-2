@@ -7,6 +7,8 @@ data/test_set/debug_data
 data/test_set/databases
 data/test_set/databases_ser_tab
 
+data/podcast_set
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
