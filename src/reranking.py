@@ -135,10 +135,11 @@ class LLMReranker:
                 
                 for doc, rank in zip(batch, block_rankings):
                     doc_with_score = doc.copy()
+                    # print(doc)
                     doc_with_score["relevance_score"] = rank["relevance_score"]
                     doc_with_score["combined_score"] = round(
                         llm_weight * rank["relevance_score"] + 
-                        vector_weight * doc['distance'],
+                        vector_weight * doc.get('score', 0.0),
                         4
                     )
                     results.append(doc_with_score)
