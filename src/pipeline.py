@@ -14,12 +14,15 @@ from src.ingestion import VectorDBIngestor, BM25Ingestor # Already adapted
 from src.questions_processing import QuestionsProcessor # Adapted with processing_flow
 from src.tables_serialization import TableSerializer # Not used for podcasts
 
+
+_log = logging.getLogger(__name__)
+
 @dataclass
 class PipelineConfig:
     root_path: Path
     processing_flow: str = "annual_report"  # "annual_report" or "podcast"
     questions_file_name: str = "questions.json"
-    pdf_input_dir_name: str = "pdf_reports" # Generic name, will be 'pdf_reports' or 'podcast_pdfs'
+    pdf_input_dir_name: str = "podcast_pdfs" # Generic name, will be 'pdf_reports' or 'podcast_pdfs'
     subset_name: Optional[str] = "subset.csv" # Optional, used for annual reports
     serialized_tables: bool = False # Specific to annual reports
     config_suffix: str = ""
@@ -91,7 +94,7 @@ class PipelineConfig:
 
 @dataclass
 class RunConfig:
-    processing_flow: str = "annual_report" # New field: "annual_report" or "podcast"
+    processing_flow: str = "podcast" # New field: "annual_report" or "podcast"
     use_serialized_tables: bool = False # Relevant for annual_report flow
     parent_document_retrieval: bool = False
     # use_vector_dbs: bool = True # Assumed True if create_vector_dbs is called
@@ -158,32 +161,9 @@ class Pipeline:
 
     @staticmethod
     def download_docling_models(): 
-        # This method seems generic enough.
-        logging.basicConfig(level=logging.INFO) # Changed to INFO
-        # Create a dummy PDF path for the dummy run if needed, or ensure dummy_report.pdf exists
-        dummy_pdf_path = here() / "src/dummy_report.pdf"
-        if not dummy_pdf_path.exists():
-            _log.warning(f"Dummy PDF for model download not found at {dummy_pdf_path}. Creating a placeholder.")
-            # Create a simple placeholder PDF if it doesn't exist to avoid error,
-            # though docling might handle this. For safety:
-            try:
-                from reportlab.pdfgen import canvas
-                c = canvas.Canvas(str(dummy_pdf_path))
-                c.drawString(100, 750, "Dummy PDF for model download.")
-                c.save()
-                _log.info(f"Created placeholder dummy PDF at {dummy_pdf_path}")
-            except ImportError:
-                _log.error("ReportLab not installed. Cannot create dummy PDF. Please ensure dummy_report.pdf exists or install reportlab.")
-                return
-            except Exception as e:
-                _log.error(f"Could not create dummy PDF: {e}")
-                return
-
-        parser = PDFParser(output_dir=here() / "temp_docling_output") # Use a temp output
-        parser.parse_and_export(input_doc_paths=[dummy_pdf_path])
-        # Clean up dummy PDF and temp output if desired, or leave for inspection
-        # os.remove(dummy_pdf_path) # Optional: remove dummy after use
-        # shutil.rmtree(here() / "temp_docling_output") # Optional: remove temp dir
+        logging.basicConfig(level=logging.DEBUG)
+        parser = PDFParser(output_dir=here())
+        parser.parse_and_export(input_doc_paths=[here() / "src/dummy_report.pdf"])
 
     def _get_pdf_parser_instance(self) -> PDFParser:
         """Helper to create PDFParser instance based on flow."""
@@ -222,20 +202,13 @@ class Pipeline:
         )
         _log.info(f"PDFs parsed (parallel) and saved to {self.paths.parsed_output_path}")
 
-    def serialize_tables(self, max_workers: int = 10): # Only for annual_report flow
-        if self.run_config.processing_flow != "annual_report":
-            _log.info("Skipping table serialization for non-annual_report flow.")
-            return
-        if not self.run_config.use_serialized_tables:
-            _log.info("Skipping table serialization as use_serialized_tables is False.")
-            return
-
-        logging.basicConfig(level=logging.INFO)
-            self.paths.parsed_output_path, # Should be parsed_reports_path for annual reports
+    def serialize_tables(self, max_workers: int = 10):
+        """Process tables in files using parallel threading"""
+        serializer = TableSerializer()
+        serializer.process_directory_parallel(
+            self.paths.parsed_reports_path,
             max_workers=max_workers
         )
-        _log.info(f"Table serialization completed for {self.paths.parsed_output_path}")
-
 
     def simplify_parsed_output(self): # Renamed from merge_reports
         """
@@ -322,13 +295,18 @@ class Pipeline:
             # This implies tables are within the JSONs in parsed_output_path
             serialized_tables_dir_param = self.paths.parsed_output_path
         
-        text_splitter.split_all_documents( # Renamed method in TextSplitter
+        text_splitter.split_all_documents(
             input_json_dir=input_dir_for_chunking,
-            output_chunk_dir=self.paths.documents_dir, # This is `databases/chunked_{flow}`
+            output_chunk_dir=self.paths.documents_dir,
+            serialized_tables_dir=serialized_tables_dir_param 
+        )
+        # text_splitter.split_all_documents( # Renamed method in TextSplitter
+            # input_json_dir=input_dir_for_chunking,
+            # output_chunk_dir=self.paths.documents_dir, # This is `databases/chunked_{flow}`
             # tables_json_dir is for external table data, if TextSplitter handles it that way
             # For now, assuming tables are part of the main JSON if use_serialized_tables is true for reports
-            tables_json_dir=serialized_tables_dir_param
-        )
+            # tables_json_dir=serialized_tables_dir_param
+        # )
         _log.info(f"Chunked documents saved to {self.paths.documents_dir}")
 
     def create_vector_dbs(self):
